@@ -114,4 +114,5 @@ E apague a função `trs` do seu `~/.zshrc`.
 
 ---
 
-Feito por [Albatroz Studio](https://albatroz.studio). Use à vontade.
+Feito por [Albatroz Studio](https://albatroz.studio). Licença MIT: use, modifique
+e distribua à vontade.
