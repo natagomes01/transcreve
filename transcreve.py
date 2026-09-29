@@ -125,22 +125,61 @@ def extrai_audio(video: Path, wav: Path) -> None:
     )
 
 
+# Presets de alignment heads que o whisper-cli aceita em -dtw. Cada modelo tem
+# as suas cabeças de atenção que acompanham o tempo do áudio.
+PRESETS_DTW = frozenset({
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "medium", "medium.en", "large.v1", "large.v2", "large.v3",
+    "large.v3.turbo",
+})
+
+
+def preset_dtw(modelo_nome: str) -> str:
+    """large-v3-turbo -> large.v3.turbo. Sufixo de quantização (-q5_0, -q8_0)
+    não muda as cabeças de atenção e sai do nome."""
+    base = re.sub(r"-q\d.*$", "", modelo_nome)
+    preset = base.replace("-", ".")
+    if preset not in PRESETS_DTW:
+        raise Falha(
+            f"o modelo '{modelo_nome}' não tem preset de DTW, então --palavras "
+            "não funciona com ele. Use um modelo padrão (ex.: large-v3-turbo)."
+        )
+    return preset
+
+
+def comando_whisper(binario: str, modelo: Path, wav: Path, idioma: str,
+                    prompt: str, prefixo: Path, palavras: bool,
+                    modelo_nome: str) -> list[str]:
+    cmd = [binario, "-m", str(modelo), "-f", str(wav), "-l", idioma,
+           "--prompt", prompt, "-sns", "-np",
+           # Corta curto e no limite da palavra. Sozinho o modelo emite blocos de
+           # 10 s, e o timestamp fica grosso demais pra achar o corte na edição.
+           # O agrupamento por frase, mais abaixo, remonta o texto.
+           "-ml", "60", "-sow",
+           "-osrt"]
+    if palavras:
+        # -nfa é obrigatório: com flash attention ligada (padrão) o whisper
+        # pula o DTW sem avisar e todo t_dtw volta -1.
+        cmd += ["-nfa", "-ojf", "-dtw", preset_dtw(modelo_nome)]
+    return cmd + ["-of", str(prefixo)]
+
+
 def roda_whisper(wav: Path, modelo: Path, idioma: str, prompt: str,
-                 prefixo: Path) -> Path:
+                 prefixo: Path, palavras: bool = False,
+                 modelo_nome: str = "large-v3-turbo") -> Path:
     subprocess.run(
-        [exige("whisper-cli", "brew install whisper-cpp"),
-         "-m", str(modelo), "-f", str(wav), "-l", idioma,
-         "--prompt", prompt, "-sns", "-np",
-         # Corta curto e no limite da palavra. Sozinho o modelo emite blocos de
-         # 10 s, e o timestamp fica grosso demais pra achar o corte na edição.
-         # O agrupamento por frase, mais abaixo, remonta o texto.
-         "-ml", "60", "-sow",
-         "-osrt", "-of", str(prefixo)],
+        comando_whisper(exige("whisper-cli", "brew install whisper-cpp"),
+                        modelo, wav, idioma, prompt, prefixo, palavras,
+                        modelo_nome),
         check=True,
     )
-    srt = prefixo.with_suffix(".srt")
+    # O whisper acrescenta a extensão ao prefixo (-of x -> x.srt). Montado por
+    # string, não por with_suffix: em "aula 1.2" o with_suffix trocaria o ".2".
+    srt = Path(f"{prefixo}.srt")
     if not srt.exists():
         raise Falha("o whisper terminou sem escrever o .srt")
+    if palavras and not Path(f"{prefixo}.json").exists():
+        raise Falha("o whisper terminou sem escrever o .json (-ojf)")
     return srt
 
 
