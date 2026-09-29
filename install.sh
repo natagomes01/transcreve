@@ -83,7 +83,7 @@ else
 # trs <arquivo|pasta> — transcreve vídeo/áudio para Markdown com timestamps.
 trs() {
   if [ \$# -eq 0 ]; then
-    echo "uso: trs <arquivo.mp4|pasta> [--saida DIR] [--srt] [--prompt \"nomes próprios\"]" >&2
+    echo "uso: trs <arquivo.mp4|pasta> [--saida DIR] [--srt] [--palavras] [--prompt \"nomes próprios\"]" >&2
     return 1
   fi
   python3 "$DIR_APP/transcreve.py" "\$@"
@@ -99,6 +99,7 @@ Abra uma aba nova do terminal (ou rode: source $RC) e use:
   trs video.mp4              # o .md nasce do lado do vídeo
   trs ~/Videos/              # a pasta inteira
   trs video.mp4 --srt        # guarda a legenda .srt também
+  trs video.mp4 --palavras   # grava o tempo de cada palavra (.palavras.json)
 
 Erra nome próprio? Ensine, em vez de corrigir na mão:
 
