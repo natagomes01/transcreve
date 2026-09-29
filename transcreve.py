@@ -15,6 +15,8 @@ Opções:
     --saida DIR       onde escrever o .md (padrão: ao lado do vídeo)
     --prompt TEXTO    prompt inicial que ensina nomes próprios ao modelo
     --srt             guarda também o .srt bruto ao lado do .md
+    --palavras        grava também <nome>.palavras.json com o tempo de cada
+                      palavra (DTW), para legenda palavra a palavra
 
 Só usa a stdlib do Python. Depende de ffmpeg e whisper-cli no PATH.
 """
@@ -22,6 +24,7 @@ Só usa a stdlib do Python. Depende de ffmpeg e whisper-cli no PATH.
 from __future__ import annotations  # anotações novas no python3 do sistema (3.9)
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -57,6 +60,7 @@ PAUSA_PARAGRAFO = 0.8
 # deslocamento o p90 do erro cai de ~0,3-0,46 s para 0,14 s. Em centésimos de
 # segundo, que é a unidade do t_dtw, para a conta sair exata.
 DTW_DESLOCAMENTO_CS = -15
+PALAVRAS_VERSAO = 1
 
 
 class Falha(Exception):
@@ -357,8 +361,21 @@ def monta_markdown(video: Path, frases: list[dict], modelo: str,
     return "\n".join(linhas)
 
 
+def monta_palavras_json(palavras: list[dict], modelo: str, idioma: str,
+                        duracao: float) -> dict:
+    return {
+        "version": PALAVRAS_VERSAO,
+        "model": modelo,
+        "language": idioma,
+        "dtw_shift_s": DTW_DESLOCAMENTO_CS / 100,
+        "duration_s": round(duracao, 2),
+        "words": palavras,
+    }
+
+
 def transcreve(video: Path, modelo_nome: str, idioma: str, prompt: str,
-               saida_dir: Path | None, guardar_srt: bool) -> Path:
+               saida_dir: Path | None, guardar_srt: bool,
+               palavras: bool = False) -> Path:
     modelo = garante_modelo(modelo_nome)
     destino_dir = saida_dir or video.parent
     destino_dir.mkdir(parents=True, exist_ok=True)
@@ -368,16 +385,32 @@ def transcreve(video: Path, modelo_nome: str, idioma: str, prompt: str,
         tmp = Path(tmp)
         wav = tmp / "audio.wav"
         extrai_audio(video, wav)
-        srt = roda_whisper(wav, modelo, idioma, prompt, tmp / video.stem)
+        srt = roda_whisper(wav, modelo, idioma, prompt, tmp / video.stem,
+                           palavras, modelo_nome)
         if guardar_srt:
             shutil.copy2(srt, destino_dir / f"{video.stem}.srt")
         blocos = le_srt(srt)
+        lista = None
+        if palavras:
+            # Lido e validado ainda dentro do tmp: se o DTW veio quebrado, a
+            # Falha sobe antes de qualquer arquivo de palavras ser gravado.
+            # surrogateescape: o whisper pode gravar meio caractere num token;
+            # palavras_de_json remonta o UTF-8 quando junta os pedaços.
+            bruto = json.loads(Path(f"{tmp / video.stem}.json").read_bytes()
+                               .decode("utf-8", "surrogateescape"))
+            lista = palavras_de_json(bruto)
 
+    duracao = duracao_segundos(video)
     frases = agrupa_em_frases(divide_por_frase(blocos))
-    md.write_text(
-        monta_markdown(video, frases, modelo_nome, duracao_segundos(video)),
-        encoding="utf-8",
-    )
+    md.write_text(monta_markdown(video, frases, modelo_nome, duracao),
+                  encoding="utf-8")
+    if lista is not None:
+        destino = destino_dir / f"{video.stem}.palavras.json"
+        destino.write_text(
+            json.dumps(monta_palavras_json(lista, modelo_nome, idioma, duracao),
+                       ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
     return md
 
 
@@ -407,6 +440,9 @@ def main() -> int:
     ap.add_argument("--saida", default=None, help="pasta de destino do .md")
     ap.add_argument("--prompt", default=PROMPT_PADRAO)
     ap.add_argument("--srt", action="store_true", help="guardar também o .srt")
+    ap.add_argument("--palavras", action="store_true",
+                    help="gravar também <nome>.palavras.json com o tempo de "
+                         "cada palavra (DTW)")
     args = ap.parse_args()
 
     videos = alvos(args.entradas)
@@ -420,7 +456,7 @@ def main() -> int:
         print(f"[{i}/{len(videos)}] {video.name}", flush=True)
         try:
             md = transcreve(video, args.modelo, args.idioma, args.prompt,
-                            saida_dir, args.srt)
+                            saida_dir, args.srt, args.palavras)
             print(f"  -> {md}", flush=True)
         except (Falha, subprocess.CalledProcessError) as erro:
             print(f"  FALHOU: {erro}", file=sys.stderr)
