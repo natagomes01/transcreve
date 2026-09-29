@@ -1,0 +1,29 @@
+{
+  "transcription": [
+    {
+      "offsets": {"from": 0, "to": 2000},
+      "text": " O rei chegou.",
+      "tokens": [
+        {"text": "[_BEG_]", "offsets": {"from": 0, "to": 0}, "p": 0.90, "t_dtw": -1},
+        {"text": " O", "offsets": {"from": 0, "to": 200}, "p": 0.98, "t_dtw": 12},
+        {"text": " re", "offsets": {"from": 200, "to": 400}, "p": 0.95, "t_dtw": 40},
+        {"text": "i", "offsets": {"from": 400, "to": 500}, "p": 0.90, "t_dtw": 55},
+        {"text": " chegou", "offsets": {"from": 500, "to": 900}, "p": 0.99, "t_dtw": 70},
+        {"text": ".", "offsets": {"from": 900, "to": 1000}, "p": 0.97, "t_dtw": 95}
+      ]
+    },
+    {
+      "offsets": {"from": 2000, "to": 3000},
+      "text": " Bom dia , amigos",
+      "tokens": [
+        {"text": "[_BEG_]", "offsets": {"from": 2000, "to": 2000}, "p": 0.90, "t_dtw": -1},
+        {"text": " Bom", "offsets": {"from": 2000, "to": 2200}, "p": 1.00, "t_dtw": 210},
+        {"text": " dia", "offsets": {"from": 2200, "to": 2500}, "p": 0.80, "t_dtw": 240},
+        {"text": " ,", "offsets": {"from": 2500, "to": 2550}, "p": 0.70, "t_dtw": 262},
+        {"text": "", "offsets": {"from": 2550, "to": 2550}, "p": 0.50, "t_dtw": 263},
+        {"text": " amigos", "offsets": {"from": 2550, "to": 3000}, "p": 0.96, "t_dtw": 270},
+        {"text": "[_TT_150]", "offsets": {"from": 3000, "to": 3000}, "p": 0.50, "t_dtw": -1}
+      ]
+    }
+  ]
+}

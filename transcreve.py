@@ -15,6 +15,8 @@ Opções:
     --saida DIR       onde escrever o .md (padrão: ao lado do vídeo)
     --prompt TEXTO    prompt inicial que ensina nomes próprios ao modelo
     --srt             guarda também o .srt bruto ao lado do .md
+    --palavras        grava também <nome>.palavras.json com o tempo de cada
+                      palavra (DTW), para legenda palavra a palavra
 
 Só usa a stdlib do Python. Depende de ffmpeg e whisper-cli no PATH.
 """
@@ -22,6 +24,7 @@ Só usa a stdlib do Python. Depende de ffmpeg e whisper-cli no PATH.
 from __future__ import annotations  # anotações novas no python3 do sistema (3.9)
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -51,6 +54,13 @@ FIM_DE_FRASE = re.compile(r"[.!?…]['\"”’)]?$")
 TETO_FRASE = 220
 # Pausa (em segundos) que vira quebra de parágrafo no texto corrido.
 PAUSA_PARAGRAFO = 0.8
+
+# Tempo por palavra (--palavras). O DTW do whisper.cpp marca cada palavra uns
+# 0,15 s depois do começo real da fala; medido contra silencedetect, com o
+# deslocamento o p90 do erro cai de ~0,3-0,46 s para 0,14 s. Em centésimos de
+# segundo, que é a unidade do t_dtw, para a conta sair exata.
+DTW_DESLOCAMENTO_CS = -15
+PALAVRAS_VERSAO = 1
 
 
 class Falha(Exception):
@@ -119,22 +129,61 @@ def extrai_audio(video: Path, wav: Path) -> None:
     )
 
 
+# Presets de alignment heads que o whisper-cli aceita em -dtw. Cada modelo tem
+# as suas cabeças de atenção que acompanham o tempo do áudio.
+PRESETS_DTW = frozenset({
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "medium", "medium.en", "large.v1", "large.v2", "large.v3",
+    "large.v3.turbo",
+})
+
+
+def preset_dtw(modelo_nome: str) -> str:
+    """large-v3-turbo -> large.v3.turbo. Sufixo de quantização (-q5_0, -q8_0)
+    não muda as cabeças de atenção e sai do nome."""
+    base = re.sub(r"-q\d.*$", "", modelo_nome)
+    preset = base.replace("-", ".")
+    if preset not in PRESETS_DTW:
+        raise Falha(
+            f"o modelo '{modelo_nome}' não tem preset de DTW, então --palavras "
+            "não funciona com ele. Use um modelo padrão (ex.: large-v3-turbo)."
+        )
+    return preset
+
+
+def comando_whisper(binario: str, modelo: Path, wav: Path, idioma: str,
+                    prompt: str, prefixo: Path, palavras: bool,
+                    modelo_nome: str) -> list[str]:
+    cmd = [binario, "-m", str(modelo), "-f", str(wav), "-l", idioma,
+           "--prompt", prompt, "-sns", "-np",
+           # Corta curto e no limite da palavra. Sozinho o modelo emite blocos de
+           # 10 s, e o timestamp fica grosso demais pra achar o corte na edição.
+           # O agrupamento por frase, mais abaixo, remonta o texto.
+           "-ml", "60", "-sow",
+           "-osrt"]
+    if palavras:
+        # -nfa é obrigatório: com flash attention ligada (padrão) o whisper
+        # pula o DTW sem avisar e todo t_dtw volta -1.
+        cmd += ["-nfa", "-ojf", "-dtw", preset_dtw(modelo_nome)]
+    return cmd + ["-of", str(prefixo)]
+
+
 def roda_whisper(wav: Path, modelo: Path, idioma: str, prompt: str,
-                 prefixo: Path) -> Path:
+                 prefixo: Path, palavras: bool = False,
+                 modelo_nome: str = "large-v3-turbo") -> Path:
     subprocess.run(
-        [exige("whisper-cli", "brew install whisper-cpp"),
-         "-m", str(modelo), "-f", str(wav), "-l", idioma,
-         "--prompt", prompt, "-sns", "-np",
-         # Corta curto e no limite da palavra. Sozinho o modelo emite blocos de
-         # 10 s, e o timestamp fica grosso demais pra achar o corte na edição.
-         # O agrupamento por frase, mais abaixo, remonta o texto.
-         "-ml", "60", "-sow",
-         "-osrt", "-of", str(prefixo)],
+        comando_whisper(exige("whisper-cli", "brew install whisper-cpp"),
+                        modelo, wav, idioma, prompt, prefixo, palavras,
+                        modelo_nome),
         check=True,
     )
-    srt = prefixo.with_suffix(".srt")
+    # O whisper acrescenta a extensão ao prefixo (-of x -> x.srt). Montado por
+    # string, não por with_suffix: em "aula 1.2" o with_suffix trocaria o ".2".
+    srt = Path(f"{prefixo}.srt")
     if not srt.exists():
         raise Falha("o whisper terminou sem escrever o .srt")
+    if palavras and not Path(f"{prefixo}.json").exists():
+        raise Falha("o whisper terminou sem escrever o .json (-ojf)")
     return srt
 
 
@@ -207,6 +256,82 @@ def agrupa_em_frases(blocos) -> list[dict]:
     return frases
 
 
+# Pontuação que, sozinha num token com espaço antes, abre a PRÓXIMA palavra
+# (" (" + "ris" + "os" + ")" = "(risos)"), em vez de grudar na anterior.
+ABERTURA = "([{“«¿¡\"'"
+
+
+def _texto_utf8(s: str) -> str:
+    """O whisper às vezes parte um caractere de 2 bytes entre dois tokens. O
+    arquivo é lido com surrogateescape, então cada byte solto vira \\udcXX;
+    juntando os tokens da palavra e refazendo o UTF-8, o "ç" volta inteiro.
+    Meio caractere que sobrar vira U+FFFD em vez de derrubar o arquivo."""
+    return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def _tem_letra(texto: str) -> bool:
+    # byte solto (\udc80-\udcff) é pedaço de letra acentuada, não pontuação
+    return any(c.isalnum() or "\udc80" <= c <= "\udcff" for c in texto)
+
+
+def palavras_de_json(dados: dict) -> list[dict]:
+    """Junta os tokens do JSON completo do whisper (-ojf) em palavras.
+
+    Token que começa com espaço abre palavra nova; o que vem sem espaço gruda
+    na anterior (" re" + "i" = "rei"). Pontuação solta, mesmo com espaço antes,
+    também gruda, exceto a de abertura, que vira prefixo da próxima palavra.
+    Tokens especiais ([_BEG_], [_TT_150]) ficam de fora.
+
+    O tempo é o t_dtw do primeiro token com letra da palavra, menos o
+    deslocamento, nunca negativo e nunca antes da palavra anterior (o DTW não
+    garante ordem). A confiança é o menor p entre os tokens da palavra.
+
+    Palavra sem t_dtw (valor -1) derruba o arquivo: isso só acontece com a
+    flash attention ligada, e cair para os offsets daria legenda fora do tempo
+    sem ninguém perceber."""
+    palavras: list[dict] = []
+    cs_anterior = 0
+    pendente = ""        # abertura esperando a próxima palavra
+    p_pendente = 1.0
+    for segmento in dados.get("transcription", []):
+        for token in segmento.get("tokens", []):
+            texto = token.get("text", "")
+            if texto.startswith("[_") or not texto.strip():
+                continue
+            limpo = texto.strip()
+            p = float(token.get("p", 1.0))
+            letra = _tem_letra(limpo)
+            if (not letra and texto.startswith(" ") and limpo[0] in ABERTURA
+                    and all(c in ABERTURA for c in limpo)):
+                pendente += limpo
+                p_pendente = min(p_pendente, p)
+                continue
+            if palavras and not pendente and (not texto.startswith(" ") or not letra):
+                atual = palavras[-1]
+                atual["w"] += limpo
+                atual["p"] = min(atual["p"], p)
+                continue
+            dtw = token.get("t_dtw", -1)
+            if dtw is None or dtw < 0:
+                raise Falha(
+                    f"a palavra '{_texto_utf8(limpo)}' (perto de "
+                    f"{token.get('offsets', {}).get('from', 0) / 1000:.1f} s) "
+                    "veio sem tempo de DTW. Isso acontece quando a flash "
+                    "attention fica ligada: o whisper-cli precisa de -nfa "
+                    "junto com -dtw. Nada foi gravado para este arquivo."
+                )
+            cs = max(0, int(dtw) + DTW_DESLOCAMENTO_CS, cs_anterior)
+            cs_anterior = cs
+            palavras.append({"t": cs / 100, "p": min(p, p_pendente),
+                             "w": pendente + limpo})
+            pendente, p_pendente = "", 1.0
+    if pendente and palavras:
+        palavras[-1]["w"] += pendente
+    for palavra in palavras:
+        palavra["w"] = _texto_utf8(palavra["w"])
+    return palavras
+
+
 def monta_markdown(video: Path, frases: list[dict], modelo: str,
                    duracao: float) -> str:
     paragrafos, atual = [], []
@@ -236,8 +361,21 @@ def monta_markdown(video: Path, frases: list[dict], modelo: str,
     return "\n".join(linhas)
 
 
+def monta_palavras_json(palavras: list[dict], modelo: str, idioma: str,
+                        duracao: float) -> dict:
+    return {
+        "version": PALAVRAS_VERSAO,
+        "model": modelo,
+        "language": idioma,
+        "dtw_shift_s": DTW_DESLOCAMENTO_CS / 100,
+        "duration_s": round(duracao, 2),
+        "words": palavras,
+    }
+
+
 def transcreve(video: Path, modelo_nome: str, idioma: str, prompt: str,
-               saida_dir: Path | None, guardar_srt: bool) -> Path:
+               saida_dir: Path | None, guardar_srt: bool,
+               palavras: bool = False) -> Path:
     modelo = garante_modelo(modelo_nome)
     destino_dir = saida_dir or video.parent
     destino_dir.mkdir(parents=True, exist_ok=True)
@@ -247,16 +385,32 @@ def transcreve(video: Path, modelo_nome: str, idioma: str, prompt: str,
         tmp = Path(tmp)
         wav = tmp / "audio.wav"
         extrai_audio(video, wav)
-        srt = roda_whisper(wav, modelo, idioma, prompt, tmp / video.stem)
+        srt = roda_whisper(wav, modelo, idioma, prompt, tmp / video.stem,
+                           palavras, modelo_nome)
         if guardar_srt:
             shutil.copy2(srt, destino_dir / f"{video.stem}.srt")
         blocos = le_srt(srt)
+        lista = None
+        if palavras:
+            # Lido e validado ainda dentro do tmp: se o DTW veio quebrado, a
+            # Falha sobe antes de qualquer arquivo de palavras ser gravado.
+            # surrogateescape: o whisper pode gravar meio caractere num token;
+            # palavras_de_json remonta o UTF-8 quando junta os pedaços.
+            bruto = json.loads(Path(f"{tmp / video.stem}.json").read_bytes()
+                               .decode("utf-8", "surrogateescape"))
+            lista = palavras_de_json(bruto)
 
+    duracao = duracao_segundos(video)
     frases = agrupa_em_frases(divide_por_frase(blocos))
-    md.write_text(
-        monta_markdown(video, frases, modelo_nome, duracao_segundos(video)),
-        encoding="utf-8",
-    )
+    md.write_text(monta_markdown(video, frases, modelo_nome, duracao),
+                  encoding="utf-8")
+    if lista is not None:
+        destino = destino_dir / f"{video.stem}.palavras.json"
+        destino.write_text(
+            json.dumps(monta_palavras_json(lista, modelo_nome, idioma, duracao),
+                       ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
     return md
 
 
@@ -286,6 +440,9 @@ def main() -> int:
     ap.add_argument("--saida", default=None, help="pasta de destino do .md")
     ap.add_argument("--prompt", default=PROMPT_PADRAO)
     ap.add_argument("--srt", action="store_true", help="guardar também o .srt")
+    ap.add_argument("--palavras", action="store_true",
+                    help="gravar também <nome>.palavras.json com o tempo de "
+                         "cada palavra (DTW)")
     args = ap.parse_args()
 
     videos = alvos(args.entradas)
@@ -299,7 +456,7 @@ def main() -> int:
         print(f"[{i}/{len(videos)}] {video.name}", flush=True)
         try:
             md = transcreve(video, args.modelo, args.idioma, args.prompt,
-                            saida_dir, args.srt)
+                            saida_dir, args.srt, args.palavras)
             print(f"  -> {md}", flush=True)
         except (Falha, subprocess.CalledProcessError) as erro:
             print(f"  FALHOU: {erro}", file=sys.stderr)

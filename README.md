@@ -36,6 +36,7 @@ trs a.mp4 b.mov c.m4a      # vários de uma vez
 |------|----------|
 | `--saida DIR` | escreve os `.md` noutra pasta |
 | `--srt` | guarda também a legenda `.srt` |
+| `--palavras` | grava também `nome.palavras.json`, com o tempo de cada palavra |
 | `--prompt "..."` | ensina nomes próprios ao modelo |
 | `--idioma en` | outro idioma (padrão `pt`) |
 | `--modelo NOME` | outro modelo (padrão `large-v3-turbo`) |
@@ -78,6 +79,39 @@ ou resumo. A lista com timestamp é para achar o corte na hora de editar.
 A transcrição **guarda** gaguejo, repetição e take refeito. É de propósito: se
 você gravou o mesmo gancho três vezes, os três aparecem com o segundo de cada
 um, e é isso que ajuda a escolher na edição.
+
+## Tempo por palavra (`--palavras`)
+
+```bash
+trs video.mp4 --palavras
+```
+
+Além do `.md`, nasce um `video.palavras.json` com o início de cada palavra.
+Serve para legenda que acende palavra por palavra e para cortar vídeo no
+limite exato da fala.
+
+```json
+{
+  "version": 1, "model": "large-v3-turbo", "language": "pt",
+  "dtw_shift_s": -0.15, "duration_s": 600.2,
+  "words": [ {"t": 79.02, "p": 0.99, "w": "Então"}, {"t": 79.12, "p": 1.0, "w": "vamos"} ]
+}
+```
+
+- `t` é o segundo em que a palavra começa; `p` é a confiança do modelo (0 a 1);
+  `w` é a palavra, com a pontuação grudada.
+- O tempo vem do **DTW** do whisper.cpp: o modelo "olha" para o trecho do áudio
+  em que cada palavra foi dita, e um algoritmo de alinhamento acha esse ponto.
+  Medido contra o início real da fala, 90% das palavras caem a menos de
+  0,14 s do lugar certo.
+- O DTW marca a palavra um pouco atrasada, então o script adianta tudo em
+  0,15 s. O valor vai gravado no próprio JSON (`dtw_shift_s`).
+- Custa uns 30% a mais de tempo, porque o DTW exige desligar a flash attention
+  do whisper. Sem a flag, nada muda.
+- Se alguma palavra vier sem tempo, o arquivo falha com erro em vez de gravar
+  um JSON errado.
+- Só funciona com os modelos padrão do whisper.cpp (`tiny` até
+  `large-v3-turbo`).
 
 ## O que ele não faz
 
