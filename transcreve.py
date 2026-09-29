@@ -52,6 +52,12 @@ TETO_FRASE = 220
 # Pausa (em segundos) que vira quebra de parágrafo no texto corrido.
 PAUSA_PARAGRAFO = 0.8
 
+# Tempo por palavra (--palavras). O DTW do whisper.cpp marca cada palavra uns
+# 0,15 s depois do começo real da fala; medido contra silencedetect, com o
+# deslocamento o p90 do erro cai de ~0,3-0,46 s para 0,14 s. Em centésimos de
+# segundo, que é a unidade do t_dtw, para a conta sair exata.
+DTW_DESLOCAMENTO_CS = -15
+
 
 class Falha(Exception):
     pass
@@ -205,6 +211,82 @@ def agrupa_em_frases(blocos) -> list[dict]:
         frases.append({"inicio": inicio, "texto": buffer.strip(),
                        "pausa": pausa})
     return frases
+
+
+# Pontuação que, sozinha num token com espaço antes, abre a PRÓXIMA palavra
+# (" (" + "ris" + "os" + ")" = "(risos)"), em vez de grudar na anterior.
+ABERTURA = "([{“«¿¡\"'"
+
+
+def _texto_utf8(s: str) -> str:
+    """O whisper às vezes parte um caractere de 2 bytes entre dois tokens. O
+    arquivo é lido com surrogateescape, então cada byte solto vira \\udcXX;
+    juntando os tokens da palavra e refazendo o UTF-8, o "ç" volta inteiro.
+    Meio caractere que sobrar vira U+FFFD em vez de derrubar o arquivo."""
+    return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def _tem_letra(texto: str) -> bool:
+    # byte solto (\udc80-\udcff) é pedaço de letra acentuada, não pontuação
+    return any(c.isalnum() or "\udc80" <= c <= "\udcff" for c in texto)
+
+
+def palavras_de_json(dados: dict) -> list[dict]:
+    """Junta os tokens do JSON completo do whisper (-ojf) em palavras.
+
+    Token que começa com espaço abre palavra nova; o que vem sem espaço gruda
+    na anterior (" re" + "i" = "rei"). Pontuação solta, mesmo com espaço antes,
+    também gruda, exceto a de abertura, que vira prefixo da próxima palavra.
+    Tokens especiais ([_BEG_], [_TT_150]) ficam de fora.
+
+    O tempo é o t_dtw do primeiro token com letra da palavra, menos o
+    deslocamento, nunca negativo e nunca antes da palavra anterior (o DTW não
+    garante ordem). A confiança é o menor p entre os tokens da palavra.
+
+    Palavra sem t_dtw (valor -1) derruba o arquivo: isso só acontece com a
+    flash attention ligada, e cair para os offsets daria legenda fora do tempo
+    sem ninguém perceber."""
+    palavras: list[dict] = []
+    cs_anterior = 0
+    pendente = ""        # abertura esperando a próxima palavra
+    p_pendente = 1.0
+    for segmento in dados.get("transcription", []):
+        for token in segmento.get("tokens", []):
+            texto = token.get("text", "")
+            if texto.startswith("[_") or not texto.strip():
+                continue
+            limpo = texto.strip()
+            p = float(token.get("p", 1.0))
+            letra = _tem_letra(limpo)
+            if (not letra and texto.startswith(" ") and limpo[0] in ABERTURA
+                    and all(c in ABERTURA for c in limpo)):
+                pendente += limpo
+                p_pendente = min(p_pendente, p)
+                continue
+            if palavras and not pendente and (not texto.startswith(" ") or not letra):
+                atual = palavras[-1]
+                atual["w"] += limpo
+                atual["p"] = min(atual["p"], p)
+                continue
+            dtw = token.get("t_dtw", -1)
+            if dtw is None or dtw < 0:
+                raise Falha(
+                    f"a palavra '{_texto_utf8(limpo)}' (perto de "
+                    f"{token.get('offsets', {}).get('from', 0) / 1000:.1f} s) "
+                    "veio sem tempo de DTW. Isso acontece quando a flash "
+                    "attention fica ligada: o whisper-cli precisa de -nfa "
+                    "junto com -dtw. Nada foi gravado para este arquivo."
+                )
+            cs = max(0, int(dtw) + DTW_DESLOCAMENTO_CS, cs_anterior)
+            cs_anterior = cs
+            palavras.append({"t": cs / 100, "p": min(p, p_pendente),
+                             "w": pendente + limpo})
+            pendente, p_pendente = "", 1.0
+    if pendente and palavras:
+        palavras[-1]["w"] += pendente
+    for palavra in palavras:
+        palavra["w"] = _texto_utf8(palavra["w"])
+    return palavras
 
 
 def monta_markdown(video: Path, frases: list[dict], modelo: str,
